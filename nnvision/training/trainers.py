@@ -25,7 +25,17 @@ except:
 from ..utility import measures
 from ..utility.measures import get_correlations, get_poisson_loss
 
+try:
+    import wandb
+except ImportError:
+    print("wandb not installed, not logging to wandb")
+from sklearn.cluster import KMeans
+from torch.nn import KLDivLoss
+import math
+torch.pi = math.pi
 
+
+# todo - add Nina's loss and wandb tracker here
 def nnvision_trainer(
     model,
     dataloaders,
@@ -53,6 +63,16 @@ def nnvision_trainer(
     return_test_score=False,
     batchping=1000,
     adamw=False,
+    wandb_logger=None,
+    include_kldivergence=True,
+    cluster_number=10,
+    alpha=1.0,
+    dec_starting_epoch=5,
+    kmeans_init=20,
+    base_multiplier=4e3,
+    use_diag_cov=True,
+    # learn_alpha=False,
+    exponent=2,
     **kwargs,
 ):
     """
@@ -87,6 +107,97 @@ def nnvision_trainer(
 
     """
 
+    def get_multiplier(epoch, base_multiplier=4e3):
+        """Multiplier to scale KL loss in same order of magnitude as main loss
+        To avoid hard peek aat starting epoch we include a warm-up phase s.t. the loss can increase slower
+        """
+        if epoch < dec_starting_epoch:
+            return 0
+        else:
+            return base_multiplier
+
+    def target_distribution(batch: torch.Tensor, exponent=exponent) -> torch.Tensor:
+        """
+        Compute the target distribution p_ij, given the batch (q_ij), as in 3.1.3 Equation 3 of
+        Xie/Girshick/Farhadi; this is used the KL-divergence loss function.
+        p_ij = (q_ij^2/f_j) / sum_j'(q_ij'^2/f_j')  f_j =sum_i(q_ij)
+
+        :param batch: [batch size, number of clusters] Tensor of dtype float
+        :return: [batch size, number of clusters] Tensor of dtype float
+        """
+        weight = (batch**exponent) / torch.sum(batch, 0)
+        return (weight.t() / torch.sum(weight, 1)).t()
+
+
+    def soft_assignments_mult(encoded_features, cluster_centers, sigma, alpha, p=1):
+        sigma_inv = 1.0 / sigma  # (K, D)
+        diff = encoded_features.T.unsqueeze(1) - cluster_centers.unsqueeze(0)  # (N, K, D)
+        norm_sigma = torch.sum(diff * sigma_inv * diff, dim=2)  # (N, K)
+        det = torch.sum(torch.log(sigma), dim=1)  # log(det) since sigma is diagonal
+        log_gamma_top = torch.lgamma((alpha + p) / 2)
+        log_gamma_bottom = torch.lgamma(alpha / 2)
+        # Log-density formula for multivariate Student-t
+        log_pdf = (
+            log_gamma_top
+            - log_gamma_bottom
+            - 0.5 * det
+            - (p / 2) * torch.log(alpha * torch.pi)
+            - ((alpha + p) / 2) * torch.log(1 + (norm_sigma / alpha))
+        )
+        #log_pdf_max = torch.max(log_pdf, dim=1, keepdim=True)[0]  # Get max per row
+
+        log_assignments = log_pdf - torch.logsumexp(log_pdf, dim=1, keepdim=True)
+        return torch.exp(log_assignments)  # Convert log-assignments to probabilities
+
+    def EM_t_mult(features, resp, cluster_centers, sigma, alpha, d=1):
+        sigma_inv = 1.0 / sigma  # (K,)
+        diff = features.T.unsqueeze(1) - cluster_centers.unsqueeze(0)
+        norm_sigma = torch.sum((diff**2 * sigma_inv), 2)
+        u = ((alpha + d) / (alpha + norm_sigma)).detach()  # ccalculate U shape(N,K)
+        
+        """ M step """
+        numerator = torch.matmul(features, resp * u).T.detach()
+        denominator = torch.sum(resp * u, dim=0, keepdim=True).T.detach()
+        cluster_centers = numerator / denominator
+
+        weighted_sq_diff = resp.unsqueeze(2) * u.unsqueeze(2) * (diff**2)  # (N, K, D)
+        numerator = weighted_sq_diff.sum(dim=0)  # (K,D)
+        denominator = torch.sum(resp, dim=0, keepdim=True)  # (K,)
+        sigma = (numerator / denominator.T).detach()
+
+        sigma = torch.clamp(sigma, min=1e-4, max=1e4)
+
+        return cluster_centers, sigma
+
+    def EM_t_1D(features, resp, cluster_centers, taus, alpha, d=1):
+        norm_squared = torch.sum(
+            (features.T.unsqueeze(1) - cluster_centers.unsqueeze(0)) ** 2, dim=2
+        )
+        u = (alpha + d) / (
+            alpha + norm_squared * (taus ** (-1))
+        )  # ccalculate U shape(N,K)
+        print("u", u)
+
+        """ M step """
+        numerator = torch.matmul(features, resp * u).T.detach()
+        # print(numerator.shape)
+        denominator = torch.sum(resp * u, dim=0, keepdim=True).T.detach()
+        print("denom cc", denominator)
+        cluster_centers = numerator / denominator
+
+        weighted_sums = torch.sum(resp * u * norm_squared, dim=0)
+        taus = (weighted_sums / torch.sum(resp, dim=0, keepdim=True)).detach()
+        print("Tau", taus)
+        return cluster_centers, taus
+
+    def soft_assignments_1D(encoded_features, cluster_centers, tau, alpha=1):
+        norm_squared = torch.sum(
+            (encoded_features.T.unsqueeze(1) - cluster_centers.unsqueeze(0)) ** 2, 2
+        )
+        assignments = 1.0 / (1.0 + (norm_squared / (alpha * tau)))
+        assignments = (assignments ** ((alpha + 1) / 2)) / (tau**1 / 2)
+        return assignments / torch.sum(assignments, dim=1, keepdim=True)
+
     def full_objective(model, dataloader, data_key, *args, **kwargs):
         """
 
@@ -115,6 +226,10 @@ def nnvision_trainer(
     model.to(device)
     set_random_seed(seed)
     model.train()
+
+    kldiv_criterion = KLDivLoss(
+        size_average=False
+    )  # losses are summed for each minibatch
 
     criterion = getattr(mlmeasures, loss_function)(avg=avg_loss)
     stop_closure = partial(
@@ -170,10 +285,19 @@ def nnvision_trainer(
         )
         if hasattr(model, "tracked_values"):
             tracker_dict.update(model.tracked_values)
+
+        
         tracker = MultipleObjectiveTracker(**tracker_dict)
     else:
         tracker = None
 
+    alpha = torch.tensor(alpha, device=device, requires_grad=False)
+    kldiv_list = []
+    print("Alpha: ", alpha)
+
+    epoch_loss = 0
+    epoch_loss_kldiv = 0
+    epoch_loss_kldiv_without_scaling = 0
     # train over epochs
     for epoch, val_obj in early_stopping(
         model,
@@ -189,6 +313,48 @@ def nnvision_trainer(
         scheduler=scheduler,
         lr_decay_steps=lr_decay_steps,
     ):
+        if include_kldivergence and epoch == dec_starting_epoch:
+            cluster_centers_list = []
+            kmeans = KMeans(
+                n_clusters=cluster_number, n_init=kmeans_init, random_state=seed
+            )
+            feature_list = []
+            # form initial cluster centres
+            with torch.no_grad():
+                for k, readout in model.readout.items():
+                    features = readout.features.cpu().detach().squeeze().T.numpy()
+                    feature_list.append(np.array(features))
+
+                features = np.vstack(feature_list)
+                predicted = kmeans.fit_predict(features)
+
+            cluster_centers = torch.tensor(
+                kmeans.cluster_centers_, dtype=torch.float, device=device
+            )
+            if use_diag_cov:
+                p = features.shape[1]
+                sigma = torch.zeros((cluster_number, p), device=device)
+                for k in range(cluster_number):
+                    cluster_points = torch.from_numpy(features[predicted == k]).to(
+                        device
+                    )
+                    print(f"Points for cluster {k}: {cluster_points.shape[0]}")
+                    if len(cluster_points) > 0:
+                        sigma[k] = (
+                            torch.var(cluster_points, dim=0, unbiased=True) + 1e-6
+                        )
+
+            else:
+                sigma = torch.zeros(cluster_number, device=device)
+                for k in range(cluster_number):
+                    cluster_points = torch.from_numpy(features[predicted == k]).to(
+                        device
+                    )
+                    if len(cluster_points) > 0:
+                        sigma[k] = torch.mean(
+                            torch.sum((cluster_points - cluster_centers[k]) ** 2, 1)
+                        )
+                sigma = sigma.unsqueeze(0)
 
         # print the quantities from tracker
         if verbose and tracker is not None:
@@ -216,10 +382,69 @@ def nnvision_trainer(
             )
             loss.backward()
             if (batch_no + 1) % optim_step_count == 0:
+                if include_kldivergence and epoch >= dec_starting_epoch:
+                    kldiv_loss = torch.zeros(1).to(device)
+                    feature_list = []
+                    for k, readout in model.readout.items():
+                        features = readout.features.squeeze()
+                        feature_list.append(features)
+                    feature_list = torch.cat(feature_list, dim=1)
+                    if use_diag_cov:
+                        q = soft_assignments_mult(
+                            feature_list, cluster_centers, sigma, alpha, p
+                        )
+                    else:
+                        q = soft_assignments_1D(
+                            feature_list, cluster_centers, sigma, alpha
+                        )
+                    target = target_distribution(q, exponent)
+                    target = target.clamp(min=1e-10)
+                    q = q.clamp(min=1e-10)
+
+                    kldiv_loss = get_multiplier(epoch, base_multiplier) * (
+                        kldiv_criterion(q.log(), target)
+                    )
+
+                    # To avoid underflow issues when computing this quantity, this loss expects the argument input in the log-space.
+                    # https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
+                    kldiv_loss.backward()
+                    epoch_loss_kldiv += kldiv_loss.detach()
+                    epoch_loss_kldiv_without_scaling += (
+                        kldiv_loss.detach() / get_multiplier(epoch, base_multiplier)
+                    )
+                    epoch_loss += kldiv_loss.detach()
+                    with torch.no_grad():
+                        cluster_centers_list.append(cluster_centers.cpu().detach())
+                        kldiv_list.append(
+                            kldiv_loss.cpu() / get_multiplier(epoch, base_multiplier)
+                        )
+
+                    if use_diag_cov:
+                        cluster_centers, sigma = EM_t_mult(
+                            feature_list, q, cluster_centers, sigma, alpha, p
+                        )
+                    else:
+                        cluster_centers, sigma = EM_t_1D(
+                            feature_list, q, cluster_centers, sigma, alpha
+                        )
                 optimizer.step()
                 optimizer.zero_grad()
             if (batch_no % batchping == 0) and (cb is not None):
                 cb()
+        if wandb_logger is not None:
+            tracker_info = tracker.asdict(make_copy=True)
+            wandb.log(
+                {
+                    "train_loss": loss.item(),
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "epoch": epoch,
+                    "Batch": batch_no,
+                    "val_corr": tracker_info["correlation"][-1],
+                    "val_poisson_loss": tracker_info["poisson_loss"][-1],
+                    "Epoch Train loss Kullback-Leibler-divergence": epoch_loss_kldiv,
+                    "Epoch Train loss KL without scaling main": epoch_loss_kldiv_without_scaling,
+                }
+            )
 
     ##### Model evaluation ####################################################################################################
     model.eval()
@@ -238,11 +463,29 @@ def nnvision_trainer(
     output = {k: v for k, v in tracker.log.items()} if track_training else {}
     output["validation_corr"] = validation_correlation
 
+    if include_kldivergence:
+        soft_assignments_list = []
+        for k, readout in model.readout.items():
+            features = readout.features.detach().squeeze()
+            soft_assignments_list.append(
+                soft_assignments_mult(features, cluster_centers, sigma, alpha, p)
+            )
+        predicted = torch.cat(soft_assignments_list).max(1)[1]
+        # append final cluster_centers
+        cluster_centers_list.append(cluster_centers.cpu().detach().numpy())
+        cluster_centers_np = np.array(cluster_centers_list)
+        print("Alpha: ", alpha)
+        output['cluster_centers_np'] = cluster_centers_np
+        output['predicted'] = predicted
+
+
     score = (
         np.mean(test_correlation)
         if return_test_score
         else np.mean(validation_correlation)
     )
+    if wandb_logger is not None:
+        wandb.finish()
     return score, output, model.state_dict()
 
 
