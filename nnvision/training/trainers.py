@@ -73,6 +73,7 @@ def nnvision_trainer(
     use_diag_cov=True,
     # learn_alpha=False,
     exponent=2,
+    attention_readout=False,
     **kwargs,
 ):
     """
@@ -264,6 +265,7 @@ def nnvision_trainer(
         if loss_accum_batch_n is None
         else loss_accum_batch_n
     )
+    print(f'optim_step_count={optim_step_count}')
 
     if track_training:
         tracker_dict = dict(
@@ -321,11 +323,15 @@ def nnvision_trainer(
             feature_list = []
             # form initial cluster centres
             with torch.no_grad():
-                for k, readout in model.readout.items():
-                    features = readout.features.cpu().detach().squeeze().T.numpy()
-                    feature_list.append(np.array(features))
+                if attention_readout:
+                    features = model.readout.all_sessions._features.cpu().detach().squeeze().T.numpy()
+                else:
+                    for k, readout in model.readout.items():
+                        features = readout.features.cpu().detach().squeeze().T.numpy()
+                        feature_list.append(np.array(features))
 
-                features = np.vstack(feature_list)
+                if not attention_readout:
+                    features = np.vstack(feature_list)
                 predicted = kmeans.fit_predict(features)
 
             cluster_centers = torch.tensor(
@@ -384,12 +390,18 @@ def nnvision_trainer(
             if (batch_no + 1) % optim_step_count == 0:
                 if include_kldivergence and epoch >= dec_starting_epoch:
                     kldiv_loss = torch.zeros(1).to(device)
-                    feature_list = []
-                    for k, readout in model.readout.items():
-                        features = readout.features.squeeze()
-                        feature_list.append(features)
-                    feature_list = torch.cat(feature_list, dim=1)
+                    if not attention_readout:
+                        feature_list = []
+                        for k, readout in model.readout.items():
+                            features = readout.features.squeeze()
+                            feature_list.append(features)
+                        feature_list = torch.cat(feature_list, dim=1)
+                    else:
+                        feature_list = model.readout.all_sessions._features.squeeze()
                     if use_diag_cov:
+                        # print(f'torch.isnan(sigma).any()={torch.isnan(sigma).any()},  alpha={alpha}, p={p}')
+                        # print(f'torch.isnan(cluster_centers).any()={torch.isnan(cluster_centers).any()}')
+                        # print(f'torch.isnan(feature_list).any() = {torch.isnan(feature_list).any()}')
                         q = soft_assignments_mult(
                             feature_list, cluster_centers, sigma, alpha, p
                         )
@@ -397,14 +409,19 @@ def nnvision_trainer(
                         q = soft_assignments_1D(
                             feature_list, cluster_centers, sigma, alpha
                         )
+                    # print(f'torch.isnan(q).any()={torch.isnan(q).any()}, torch.isnan(q).all()={torch.isnan(q).all()}')
+                    # print(f'exponent={exponent}')
                     target = target_distribution(q, exponent)
+                    # print(f'torch.isnan(target).any()={torch.isnan(target).any()}')
                     target = target.clamp(min=1e-10)
                     q = q.clamp(min=1e-10)
 
                     kldiv_loss = get_multiplier(epoch, base_multiplier) * (
                         kldiv_criterion(q.log(), target)
                     )
-
+                    # print(f'get_multiplier(epoch, base_multiplier)={get_multiplier(epoch, base_multiplier)}, kldiv_loss={kldiv_loss}')
+                    # print(set(target.cpu().detach().numpy().flatten().tolist()))
+                    # print((q.log()==target).all())
                     # To avoid underflow issues when computing this quantity, this loss expects the argument input in the log-space.
                     # https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
                     kldiv_loss.backward()
@@ -464,13 +481,17 @@ def nnvision_trainer(
     output["validation_corr"] = validation_correlation
 
     if include_kldivergence:
-        soft_assignments_list = []
-        for k, readout in model.readout.items():
-            features = readout.features.detach().squeeze()
-            soft_assignments_list.append(
-                soft_assignments_mult(features, cluster_centers, sigma, alpha, p)
-            )
-        predicted = torch.cat(soft_assignments_list).max(1)[1]
+        if attention_readout:
+            soft_assignments_list = []
+            for k, readout in model.readout.items():
+                features = readout.features.detach().squeeze()
+                soft_assignments_list.append(
+                    soft_assignments_mult(features, cluster_centers, sigma, alpha, p)
+                )
+            predicted = torch.cat(soft_assignments_list).max(1)[1]
+        else:
+            features = model.readout.all_sessions._features.squeeze()
+            predicted = soft_assignments_mult(features, cluster_centers, sigma, alpha, p).max(1)[1]
         # append final cluster_centers
         cluster_centers_list.append(cluster_centers.cpu().detach().numpy())
         cluster_centers_np = np.array(cluster_centers_list)
