@@ -33,6 +33,7 @@ from sklearn.cluster import KMeans
 from torch.nn import KLDivLoss
 import math
 torch.pi = math.pi
+import pickle
 
 
 # todo - add Nina's loss and wandb tracker here
@@ -69,11 +70,14 @@ def nnvision_trainer(
     alpha=1.0,
     dec_starting_epoch=5,
     kmeans_init=20,
-    base_multiplier=4e3,
+    base_multiplier=1e3,
     use_diag_cov=True,
     # learn_alpha=False,
     exponent=2,
     attention_readout=False,
+    save_checkpoint_path=None,
+    save_checkpoint_every=5,
+    # ignore_neurones=None,
     **kwargs,
 ):
     """
@@ -177,18 +181,14 @@ def nnvision_trainer(
         u = (alpha + d) / (
             alpha + norm_squared * (taus ** (-1))
         )  # ccalculate U shape(N,K)
-        print("u", u)
 
         """ M step """
         numerator = torch.matmul(features, resp * u).T.detach()
-        # print(numerator.shape)
         denominator = torch.sum(resp * u, dim=0, keepdim=True).T.detach()
-        print("denom cc", denominator)
         cluster_centers = numerator / denominator
 
         weighted_sums = torch.sum(resp * u * norm_squared, dim=0)
         taus = (weighted_sums / torch.sum(resp, dim=0, keepdim=True)).detach()
-        print("Tau", taus)
         return cluster_centers, taus
 
     def soft_assignments_1D(encoded_features, cluster_centers, tau, alpha=1):
@@ -315,6 +315,8 @@ def nnvision_trainer(
         scheduler=scheduler,
         lr_decay_steps=lr_decay_steps,
     ):
+        epoch_loss_kldiv = 0
+        epoch_loss_kldiv_without_scaling = 0
         if include_kldivergence and epoch == dec_starting_epoch:
             cluster_centers_list = []
             kmeans = KMeans(
@@ -345,10 +347,12 @@ def nnvision_trainer(
                         device
                     )
                     print(f"Points for cluster {k}: {cluster_points.shape[0]}")
-                    if len(cluster_points) > 0:
+                    if len(cluster_points) > 1:
                         sigma[k] = (
                             torch.var(cluster_points, dim=0, unbiased=True) + 1e-6
                         )
+                    else:
+                        sigma[k] += 1e-6
 
             else:
                 sigma = torch.zeros(cluster_number, device=device)
@@ -399,9 +403,10 @@ def nnvision_trainer(
                     else:
                         feature_list = model.readout.all_sessions._features.squeeze()
                     if use_diag_cov:
-                        # print(f'torch.isnan(sigma).any()={torch.isnan(sigma).any()},  alpha={alpha}, p={p}')
-                        # print(f'torch.isnan(cluster_centers).any()={torch.isnan(cluster_centers).any()}')
-                        # print(f'torch.isnan(feature_list).any() = {torch.isnan(feature_list).any()}')
+                        # if torch.isnan(sigma).any() or torch.isnan(cluster_centers).any() or torch.isnan(feature_list).any():
+                        #     print(f'batch_no={batch_no}, torch.isnan(sigma).any()={torch.isnan(sigma).any()},  alpha={alpha}, p={p}')
+                        #     print(f'batch_no={batch_no}, torch.isnan(cluster_centers).any()={torch.isnan(cluster_centers).any()}')
+                        #     print(f'batch_no={batch_no}, torch.isnan(feature_list).any() = {torch.isnan(feature_list).any()}')
                         q = soft_assignments_mult(
                             feature_list, cluster_centers, sigma, alpha, p
                         )
@@ -409,19 +414,17 @@ def nnvision_trainer(
                         q = soft_assignments_1D(
                             feature_list, cluster_centers, sigma, alpha
                         )
-                    # print(f'torch.isnan(q).any()={torch.isnan(q).any()}, torch.isnan(q).all()={torch.isnan(q).all()}')
-                    # print(f'exponent={exponent}')
+                    # if torch.isnan(q).any() or torch.isnan(q).all():
+                    #     print(f'batch_no={batch_no}, torch.isnan(q).any()={torch.isnan(q).any()}, torch.isnan(q).all()={torch.isnan(q).all()}')
                     target = target_distribution(q, exponent)
-                    # print(f'torch.isnan(target).any()={torch.isnan(target).any()}')
+                    # if torch.isnan(target).any():
+                    #     print(f'batch_no={batch_no}, torch.isnan(target).any()={torch.isnan(target).any()}')
                     target = target.clamp(min=1e-10)
                     q = q.clamp(min=1e-10)
 
                     kldiv_loss = get_multiplier(epoch, base_multiplier) * (
                         kldiv_criterion(q.log(), target)
                     )
-                    # print(f'get_multiplier(epoch, base_multiplier)={get_multiplier(epoch, base_multiplier)}, kldiv_loss={kldiv_loss}')
-                    # print(set(target.cpu().detach().numpy().flatten().tolist()))
-                    # print((q.log()==target).all())
                     # To avoid underflow issues when computing this quantity, this loss expects the argument input in the log-space.
                     # https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
                     kldiv_loss.backward()
@@ -462,6 +465,8 @@ def nnvision_trainer(
                     "Epoch Train loss KL without scaling main": epoch_loss_kldiv_without_scaling,
                 }
             )
+        if save_checkpoint_path is not None and epoch > 0 and epoch % save_checkpoint_every == 0:
+            torch.save(model.state_dict(), f'{save_checkpoint_path}epoch_{epoch}.pth')
 
     ##### Model evaluation ####################################################################################################
     model.eval()
@@ -481,7 +486,7 @@ def nnvision_trainer(
     output["validation_corr"] = validation_correlation
 
     if include_kldivergence:
-        if attention_readout:
+        if not attention_readout:
             soft_assignments_list = []
             for k, readout in model.readout.items():
                 features = readout.features.detach().squeeze()
@@ -507,6 +512,10 @@ def nnvision_trainer(
     )
     if wandb_logger is not None:
         wandb.finish()
+    if save_checkpoint_path is not None:
+            torch.save(model.state_dict(), f'{save_checkpoint_path}best.pth')
+            with open(f'{save_checkpoint_path}output_dict.pkl', 'wb') as f:
+                pickle.dump(output, f)
     return score, output, model.state_dict()
 
 
